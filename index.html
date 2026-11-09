@@ -47,6 +47,9 @@
   table{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px}
   td{padding:5px 0;border-bottom:1px solid var(--line)}
   td:last-child{text-align:right;font-family:ui-monospace,"JetBrains Mono",Menlo,monospace;color:var(--dark)}
+  .opts{width:100%;display:flex;flex-direction:column;gap:8px;font-size:14px;color:var(--ink);margin-top:4px}
+  .opts label{display:flex;gap:8px;align-items:flex-start;line-height:1.4}
+  .opts input{margin-top:3px;width:18px;height:18px;accent-color:#A04A12}
   .hidden{display:none}
 </style>
 </head>
@@ -70,6 +73,11 @@
       <div class="row">
         <label class="btn">上傳音檔<input id="fileIn" type="file" accept="audio/*"></label>
         <button class="btn" id="replayBtn" type="button" disabled>播放錄音</button>
+      </div>
+      <div class="opts">
+        <label><input type="checkbox" id="optTrim" checked> 切掉前後靜音，再置中補零（貼近訓練資料）</label>
+        <label><input type="checkbox" id="optNorm" checked> 音量正規化（峰值調到 −3 dBFS）</label>
+        <button class="btn" id="rerunBtn" type="button" disabled>用目前設定重新分析</button>
       </div>
     </div>
   </section>
@@ -96,7 +104,7 @@
     <details>
       <summary>模型與設定</summary>
       <table id="infoTable"></table>
-      <p>設定完全依照官方 TIM-Net_SER 的 <code>extract_feature.py</code>：librosa 預設 MFCC，訊號先置中補零或裁切到固定長度。官方權重以演員朗讀資料訓練，對日常說話的準確度會明顯下降。</p>
+      <p>設定完全依照官方 TIM-Net_SER 的 <code>extract_feature.py</code>：librosa 預設 MFCC，訊號先置中補零或裁切到固定長度。「切掉靜音」與「音量正規化」是本 demo 額外加的前處理，兩個都關掉時與官方完全相同。官方權重以演員朗讀資料訓練，對日常說話的準確度會明顯下降。</p>
       <label class="btn" style="display:block;margin-top:10px">載入其他權重檔（.json）<input id="weightIn" type="file" accept=".json,application/json"></label>
     </details>
   </section>
@@ -422,12 +430,33 @@ async function resample(x, srIn, srOut){
   }
 }
 
+// Energy-based trim (frame 2048 / hop 512, like librosa.effects.trim) and peak normalisation
+function trimSilence(x, sr, topDb){
+  const fl = 2048, hop = 512, n = Math.max(1, 1 + Math.floor((x.length - fl) / hop));
+  const rms = new Float32Array(n); let mx = 1e-12;
+  for (let i = 0; i < n; i++) { let s = 0; const o = i * hop; for (let j = 0; j < fl && o + j < x.length; j++) s += x[o+j] * x[o+j]; rms[i] = Math.sqrt(s / fl); if (rms[i] > mx) mx = rms[i]; }
+  const thr = mx * Math.pow(10, -topDb / 20);
+  let a = 0, b = n - 1;
+  while (a < n && rms[a] < thr) a++;
+  while (b > a && rms[b] < thr) b--;
+  if (a >= n) return x;
+  return x.slice(a * hop, Math.min(x.length, b * hop + fl));
+}
+function peakInfo(x){ let p = 0; for (let i = 0; i < x.length; i++) { const v = Math.abs(x[i]); if (v > p) p = v; } return p; }
+
+let lastRaw = null;
 async function analyse(raw, srIn){
+  lastRaw = { data: raw, sr: srIn };
+  document.getElementById("rerunBtn").disabled = false;
   const m = model.meta;
   status("分析中…");
   await new Promise(r => setTimeout(r, 30));
   const t0 = performance.now();
-  const sig = await resample(raw, srIn, m.sr);
+  let sig = await resample(raw, srIn, m.sr);
+  const peakIn = peakInfo(sig);
+  let speechSec = sig.length / m.sr;
+  if (document.getElementById("optTrim").checked) { sig = trimSilence(sig, m.sr, 30); speechSec = sig.length / m.sr; }
+  if (document.getElementById("optNorm").checked && peakIn > 1e-6) { const g = 0.708 / peakInfo(sig); sig = sig.map(v => v * g); }
   const t1 = performance.now();
   const feat = TimNet.mfcc(sig, m);
   const t2 = performance.now();
@@ -436,7 +465,9 @@ async function analyse(raw, srIn){
   lastSignal = { data: sig, sr: m.sr };
   document.getElementById("replayBtn").disabled = false;
   show(probs, feat, [t1 - t0, t2 - t1, t3 - t2]);
-  status(`完成：輸入 ${(raw.length / srIn).toFixed(1)} 秒，模型只看中間 ${(m.signal_len / m.sr).toFixed(0)} 秒`);
+  const peakDb = 20 * Math.log10(Math.max(peakIn, 1e-6));
+  const warn = peakDb < -30 ? "（收音偏小，請靠近一點）" : peakDb > -1 ? "（可能破音）" : "";
+  status(`完成：語音 ${speechSec.toFixed(1)} 秒，原始峰值 ${peakDb.toFixed(0)} dBFS${warn}`);
 }
 
 function show(probs, feat, times){
@@ -531,6 +562,8 @@ document.getElementById("fileIn").addEventListener("change", async (e) => {
   } catch (err) { status("無法讀取這個音檔格式，請改用 wav 或 m4a。"); }
   e.target.value = "";
 });
+
+document.getElementById("rerunBtn").addEventListener("click", () => { if (lastRaw) analyse(lastRaw.data, lastRaw.sr); });
 
 document.getElementById("replayBtn").addEventListener("click", () => {
   if (!lastSignal) return;
